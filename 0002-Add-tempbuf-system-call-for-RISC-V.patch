@@ -1,0 +1,233 @@
+From bbbacfb6cccd72aa38c5e3e9f2d3db69a4a1386d Mon Sep 17 00:00:00 2001
+From: xiebennies <xiebennies@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 15:40:49 +0000
+Subject: [PATCH 2/2] Add tempbuf system call for RISC-V
+
+---
+ include/linux/syscalls.h          |   2 +
+ include/uapi/asm-generic/unistd.h |   5 +-
+ kernel/Makefile                   |   2 +
+ kernel/tempbuf.c                  | 173 ++++++++++++++++++++++++++++++
+ 4 files changed, 181 insertions(+), 1 deletion(-)
+ create mode 100644 kernel/tempbuf.c
+
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index b427bfca2..4b12e179e 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1387,4 +1387,6 @@ int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
+ 		int optlen);
+ asmlinkage long sys_revstr(char __user *str, size_t n);
+ 
++asmlinkage long sys_tempbuf(int mode, void __user *data, size_t size);
++
+ #endif
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index cd92d7ebd..7e9da4eda 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -889,8 +889,11 @@ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+ #define __NR_revstr 451
+ __SYSCALL(__NR_revstr, sys_revstr)
+ 
++#define __NR_tempbuf 452
++__SYSCALL(__NR_tempbuf, sys_tempbuf)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 452
++#define __NR_syscalls 453
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 31efa40a3..50703b506 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -161,3 +161,5 @@ $(obj)/kheaders_data.tar.xz: FORCE
+ clean-files := kheaders_data.tar.xz kheaders.md5
+ 
+ obj-y += revstr.o
++
++obj-y += tempbuf.o
+diff --git a/kernel/tempbuf.c b/kernel/tempbuf.c
+new file mode 100644
+index 000000000..de1d23417
+--- /dev/null
++++ b/kernel/tempbuf.c
+@@ -0,0 +1,173 @@
++#include <linux/list.h>
++#include <linux/string.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++#include <linux/errno.h>
++#include <linux/printk.h>
++
++struct tempbuf_entry {
++	char *text;
++	size_t len;
++	struct list_head link;
++};
++
++static LIST_HEAD(tempbuf_list);
++static DEFINE_MUTEX(tempbuf_lock);
++
++enum tempbuf_mode {
++	TEMPBUF_PRINT = 0,
++	TEMPBUF_ADD = 1,
++	TEMPBUF_REMOVE = 2,
++};
++
++static long tempbuf_add(const void __user *data, size_t size)
++{
++	struct tempbuf_entry *entry;
++
++	if (size == (size_t)-1)
++		return -EINVAL;
++
++	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++	if (entry == NULL)
++		return -ENOMEM;
++
++	entry->text = kmalloc(size + 1, GFP_KERNEL);
++	if (entry->text == NULL) {
++		kfree(entry);
++		return -ENOMEM;
++	}
++
++	if (copy_from_user(entry->text, data, size) != 0) {
++		kfree(entry->text);
++		kfree(entry);
++		return -EFAULT;
++	}
++
++	entry->text[size] = '\0';
++	entry->len = size;
++
++	mutex_lock(&tempbuf_lock);
++	list_add_tail(&entry->link, &tempbuf_list);
++	pr_info("[tempbuf] Added: %s\n", entry->text);
++	mutex_unlock(&tempbuf_lock);
++
++	return 0;
++}
++
++static long tempbuf_remove(const void __user *data, size_t size)
++{
++	struct tempbuf_entry *entry;
++	char *target;
++	long ret = -ENOENT;
++
++	if (size == (size_t)-1)
++		return -EINVAL;
++
++	target = kmalloc(size + 1, GFP_KERNEL);
++	if (target == NULL)
++		return -ENOMEM;
++
++	if (copy_from_user(target, data, size) != 0) {
++		kfree(target);
++		return -EFAULT;
++	}
++	target[size] = '\0';
++
++	mutex_lock(&tempbuf_lock);
++	list_for_each_entry(entry, &tempbuf_list, link) {
++		if (entry->len == size &&
++		    memcmp(entry->text, target, size) == 0) {
++			list_del(&entry->link);
++			pr_info("[tempbuf] Removed: %s\n", entry->text);
++			kfree(entry->text);
++			kfree(entry);
++			ret = 0;
++			break;
++		}
++	}
++	mutex_unlock(&tempbuf_lock);
++
++	kfree(target);
++	return ret;
++}
++
++static long tempbuf_print(void __user *data, size_t size)
++{
++	struct tempbuf_entry *entry;
++	char *buf;
++	size_t total = 0;
++	size_t pos = 0;
++	size_t copied;
++	bool first = true;
++
++	mutex_lock(&tempbuf_lock);
++
++	list_for_each_entry(entry, &tempbuf_list, link) {
++		if (!first) {
++			if (total == (size_t)-1)
++				goto overflow;
++			total++;
++		}
++		if (entry->len > (size_t)-1 - total)
++			goto overflow;
++		total += entry->len;
++		first = false;
++	}
++	if (total == (size_t)-1)
++		goto overflow;
++
++	buf = kmalloc(total + 1, GFP_KERNEL);
++	if (buf == NULL) {
++		mutex_unlock(&tempbuf_lock);
++		return -ENOMEM;
++	}
++
++	first = true;
++	list_for_each_entry(entry, &tempbuf_list, link) {
++		if (!first)
++			buf[pos++] = ' ';
++		memcpy(buf + pos, entry->text, entry->len);
++		pos += entry->len;
++		first = false;
++	}
++	buf[pos] = '\0';
++
++	pr_info("[tempbuf] %s\n", buf);
++	mutex_unlock(&tempbuf_lock);
++
++	copied = total;
++	if (copied > size - 1)
++		copied = size - 1;
++	buf[copied] = '\0';
++
++	if (copy_to_user(data, buf, copied + 1) != 0) {
++		kfree(buf);
++		return -EFAULT;
++	}
++
++	kfree(buf);
++	return copied;
++
++overflow:
++	mutex_unlock(&tempbuf_lock);
++	return -EOVERFLOW;
++}
++
++SYSCALL_DEFINE3(tempbuf, int, mode, void __user *, data, size_t, size)
++{
++	if (data == NULL || size == 0)
++		return -EFAULT;
++
++	switch (mode) {
++	case TEMPBUF_PRINT:
++		return tempbuf_print(data, size);
++	case TEMPBUF_ADD:
++		return tempbuf_add(data, size);
++	case TEMPBUF_REMOVE:
++		return tempbuf_remove(data, size);
++	default:
++		return -EINVAL;
++	}
++}
+-- 
+2.43.0
+
